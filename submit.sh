@@ -2,7 +2,7 @@
 #SBATCH --job-name=re
 #SBATCH --time=23:59:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=32
 #SBATCH --partition=ou_bcs_normal
 #SBATCH --gres=gpu:h100:2
 #SBATCH --mem=120g
@@ -32,6 +32,7 @@ PYTHONPATH=src micromamba run -n rae torchrun --standalone --nproc_per_node=2 -m
     --mask-ratio 0.75 \
     --precision bf16 \
     --save-interval 20 \
-    --num-workers 8 \
+    --num-workers 12 \
     --include-special \
-    --output-dir results/feature_mae_vitb_accum_alltokens
+    --output-dir results/feature_mae_vitb_accum_alltokens \
+    --resume /orcd/scratch/orcd/010/jianggy/smt/RAE/results/feature_mae_vitb_accum_alltokens/checkpoint_400.pth

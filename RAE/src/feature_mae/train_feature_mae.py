@@ -42,9 +42,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="results/feature_mae")
     parser.add_argument("--log-interval", type=int, default=50)
-    parser.add_argument("--save-interval", type=int, default=1, help="Save checkpoint every N epochs.")
+    parser.add_argument("--save-interval", type=int, default=20, help="Save checkpoint every N epochs.")
     parser.add_argument("--visualize-interval", type=int, default=1000, help="Steps between recon visualisations.")
     parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--prefetch-factor", type=int, default=4, help="Batches prefetched per worker (if >0 workers).")
     parser.add_argument("--accumulation-steps", type=int, default=1)
     parser.add_argument("--clip-grad", type=float, default=0.0)
     parser.add_argument("--amp", action="store_true", help="Enable automatic mixed precision.")
@@ -111,6 +112,7 @@ def create_transform(
     std: torch.Tensor,
     *,
     input_is_tensor: bool = False,
+    apply_normalize: bool = True,
 ) -> transforms.Compose:
     ops = [
         transforms.RandomResizedCrop(
@@ -121,7 +123,8 @@ def create_transform(
     # When decoding to PIL, add ToTensor; for torchrgb, tensors are already float in [0,1]
     if not input_is_tensor:
         ops.append(transforms.ToTensor())
-    ops.append(transforms.Normalize(mean=mean, std=std))
+    if apply_normalize:
+        ops.append(transforms.Normalize(mean=mean, std=std))
     return transforms.Compose(ops)
 
 
@@ -151,14 +154,15 @@ def build_dataloader(
             .decode("torchrgb")
             .to_tuple("jpg;jpeg;png", "cls")
             .map_tuple(transform, lambda x: x)
+            .batched(args.batch_size, partial=False)
         )
         loader = wds.WebLoader(
             dataset,
-            batch_size=args.batch_size,
+            batch_size=None,
             num_workers=args.num_workers,
             pin_memory=True,
             persistent_workers=True if args.num_workers > 0 else False,
-            prefetch_factor=4 if args.num_workers > 0 else None,
+            prefetch_factor=(args.prefetch_factor if args.num_workers > 0 else None),
         )
         if args.world_size > 1 and hasattr(loader, "ddp_equalize"):
             loader = loader.ddp_equalize(args.world_size)
@@ -175,7 +179,7 @@ def build_dataloader(
         pin_memory=True,
         drop_last=True,
         persistent_workers=True if args.num_workers > 0 else False,
-        prefetch_factor=4 if args.num_workers > 0 else None,
+        prefetch_factor=(args.prefetch_factor if args.num_workers > 0 else None),
     )
     return loader, sampler
 
@@ -199,8 +203,16 @@ def adjust_learning_rate(
 
 
 def _extract_images(batch) -> torch.Tensor:
+    # Handles outputs from ImageFolder DataLoader and WebDataset (with/without dataset-side batching)
     if isinstance(batch, (list, tuple)):
-        return batch[0]
+        first = batch[0]
+        # Case: dataset-side batching -> first is a list of tensors
+        if isinstance(first, list) and len(first) > 0 and isinstance(first[0], torch.Tensor):
+            return torch.stack(first, dim=0)
+        # Case: regular tuple (tensor, label)
+        if isinstance(first, torch.Tensor):
+            return first
+        return first
     if isinstance(batch, dict):
         return batch["jpg"] if "jpg" in batch else batch["png"]
     return batch
@@ -254,6 +266,12 @@ def train_one_epoch(
         if step >= total_steps:
             break
         images = _extract_images(batch).to(device, non_blocking=True)
+        # Optimize memory layout for H100 tensor cores
+        if images.is_floating_point():
+            images = images.to(memory_format=torch.channels_last)
+        # Normalize on device for WebDataset to offload CPU
+        if getattr(args, "normalize_on_device", False):
+            images = (images - image_mean.view(1, -1, 1, 1)) / image_std.view(1, -1, 1, 1)
 
         autocast_ctx = autocast(**args.autocast_kwargs) if args.autocast_kwargs else nullcontext()
         with torch.no_grad():
@@ -412,8 +430,14 @@ def main() -> None:
     image_std = torch.tensor(processor.image_std, dtype=torch.float32, device=device).view(-1)
     data_root = Path(args.data_path)
     has_tars = any(data_root.rglob("*.tar"))
+    # For WebDataset (tensor decode), defer Normalize to GPU to reduce CPU overhead
+    args.normalize_on_device = bool(has_tars)
     transform = create_transform(
-        args.image_size, image_mean.cpu(), image_std.cpu(), input_is_tensor=has_tars
+        args.image_size,
+        image_mean.cpu(),
+        image_std.cpu(),
+        input_is_tensor=has_tars,
+        apply_normalize=not args.normalize_on_device,
     )
 
     loader, sampler = build_dataloader(args, transform)
