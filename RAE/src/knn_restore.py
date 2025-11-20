@@ -1,16 +1,72 @@
 from dataclasses import dataclass
 from pathlib import Path
 from torch.utils.data import DataLoader
+from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
 from typing import List, Optional, Tuple, Union
 from utils.model_utils import instantiate_from_config
 from utils.train_utils import parse_configs
-from restore import fit_ridge_linear_map, linear_map_predict, evaluate_reconstruction
+from restore_methods import (
+    fit_ridge_linear_map,
+    linear_map_predict,
+    evaluate_reconstruction,
+    ResidualMLP,
+)
 import dataloader
 import numpy as np
 import random
 import torch
 import torch.nn.functional as F
+
+
+def set_up():
+    config_file = "stage1/pretrained/DINOv2-B.yaml"
+    ckpt = "decoders/dinov2/wReg_base/ViTXL_n08/model.pt"
+    device = "cuda:0"
+    batch_size = 64
+    # seeds = [1912, 1985, 1976, 2001, 2024]
+    seed = 1912
+    num_workers = 1
+    # schemes = ["baseline", "crop", "occlude", "gaussian"]
+    scheme = "occlude"
+    corrupt_range = (0.50, 0.70)
+    k_neighbors = 25
+    noise_std = None
+
+    seed_everything(seed)
+    generator = torch.Generator(device=device).manual_seed(seed)
+
+    global_configs = GlobalConfigs(
+        config_file,
+        ckpt,
+        batch_size,
+        k_neighbors,
+        scheme,
+        corrupt_range,
+        noise_std,
+        device,
+        seed,
+        num_workers,
+        generator,
+    )
+    lam = None  # lam = 1 for "ridge" regressor method
+    method = "mlp"  # options: "ridge", "mlp"
+    hidden_dims = 128
+    num_layers = 3
+    dropout = 0.1
+    cosine_weight = 1
+    epochs = 1
+    restore_configs = ReconstructConfigs(
+        method,
+        lam,
+        hidden_dims,
+        num_layers,
+        dropout,
+        cosine_weight,
+        epochs,
+    )
+
+    return global_configs, restore_configs
 
 
 @dataclass
@@ -21,9 +77,10 @@ class GlobalConfigs:
     k_neighbors: int
     scheme: str
     corrupt_range: Optional[Tuple[float, float]]
-    noise_std: float
+    noise_std: Optional[float]
     device: str
     seed: int
+    num_workers: int
     generator: torch.Generator
     config_root: Union[str, Path] = (
         "/home/alicialu/orcd/scratch/large-embedding-models/RAE/configs"
@@ -49,9 +106,14 @@ class GlobalConfigs:
 
 
 @dataclass
-class ReconstructParams:
-    lam: float
+class ReconstructConfigs:
     method: str
+    lam: Optional[float]
+    hidden_dims: Optional[int]
+    num_layers: Optional[int]
+    dropout: Optional[float]
+    cosine_weight: float
+    epochs: Optional[int]
 
 
 def get_embeddings_n_labels(configs, corruption=False):
@@ -59,6 +121,7 @@ def get_embeddings_n_labels(configs, corruption=False):
         scheme = configs.scheme
     else:
         scheme = "baseline"
+    # dataloader for images
     train_loader, valid_loader = dataloader.get_imagenette_loaders(
         scheme, configs.corrupt_range, batch_size=configs.batch_size
     )
@@ -115,7 +178,7 @@ def extract_features(
     max_items: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if noise_std is None and scheme.lower() == "gaussian":
-        raise ValueError(f"`noise_std` must be defined for the scheme {{scheme}}")
+        raise ValueError(f"`noise_std` must be defined for the scheme {scheme}")
 
     feats: List[torch.Tensor] = []
     labels: List[torch.Tensor] = []
@@ -205,40 +268,9 @@ def worker_init_fn(worker_id):
     random.seed(worker_seed)
 
 
-def reconstruct():
-    config_file = "stage1/pretrained/DINOv2-B.yaml"
-    ckpt = "decoders/dinov2/wReg_base/ViTXL_n08/model.pt"
-    device = "cuda:0"
-    batch_size = 64
-    # seeds = [1912, 1985, 1976, 2001, 2024]
-    seed = 1912
-    # schemes = ["baseline", "crop", "occlude", "gaussian"]
-    scheme = "occlude"
-    corrupt_range = (0.50, 0.70)
-    k_neighbors = 25
-    noise_std = None
-
-    seed_everything(seed)
-    generator = torch.Generator(device=device).manual_seed(seed)
-
-    configs = GlobalConfigs(
-        config_file,
-        ckpt,
-        batch_size,
-        k_neighbors,
-        scheme,
-        corrupt_range,
-        noise_std,
-        device,
-        seed,
-        generator,
-    )
-    lam = 1
-    method = "ridge"
-    reconstruct_params = ReconstructParams(lam, method)
-
-    clean_embeds_n_labels = get_embeddings_n_labels(configs)
-    corrupt_embeds_n_labels = get_embeddings_n_labels(configs, corruption=True)
+def reconstruct(global_configs: GlobalConfigs, restore_configs: ReconstructConfigs):
+    clean_embeds_n_labels = get_embeddings_n_labels(global_configs)
+    corrupt_embeds_n_labels = get_embeddings_n_labels(global_configs, corruption=True)
 
     clean_train_embeddings = clean_embeds_n_labels["embeddings"]["train"]
     corrupt_train_embeddings = corrupt_embeds_n_labels["embeddings"]["train"]
@@ -247,16 +279,39 @@ def reconstruct():
     train_labels = clean_embeds_n_labels["labels"]["train"]
     valid_labels = clean_embeds_n_labels["labels"]["valid"]
 
-    if reconstruct_params.method == "ridge":
+    if restore_configs.method == "ridge":
         W, b = fit_ridge_linear_map(
             X_train=corrupt_train_embeddings,
             Y_train=clean_train_embeddings,
-            lam=reconstruct_params.lam,
+            lam=restore_configs.lam,
         )
         train_embeds_pred = linear_map_predict(corrupt_train_embeddings, W, b)
         valid_embeds_pred = linear_map_predict(corrupt_valid_embeddings, W, b)
 
-    # evaluation
+    if restore_configs.method == "mlp":
+        # dataloader for image embeddings
+        train_loader, val_loader = create_dataloaders(
+            global_configs,
+            restore_configs,
+            clean_train_embeddings,
+            corrupt_train_embeddings,
+            clean_valid_embeddings,
+            corrupt_valid_embeddings,
+        )
+        model, losses = train(
+            restore_configs,
+            train_loader,
+            val_loader,
+            global_configs.device,
+        )
+        model.eval()
+        train_embeds_pred, valid_embeds_pred = evaluate(
+            model, train_loader, val_loader, global_configs.device
+        )
+        print(f"pred train embeds: {train_embeds_pred.shape}")
+        print(f"pred valid embeds: {valid_embeds_pred.shape}")
+
+    # evaluation on train (sanity check)
     train_metrics = evaluate_reconstruction(train_embeds_pred, clean_train_embeddings)
     print("Train:", train_metrics)
     # validation reconstruction (the real test)
@@ -268,13 +323,99 @@ def reconstruct():
         train_embeds_pred,
         train_labels,
         valid_embeds_pred,
-        k=k_neighbors,
-        batch_size=batch_size,
-        device=device,
+        k=global_configs.k_neighbors,
+        batch_size=global_configs.batch_size,
+        device=global_configs.device,
     )
     accuracy = (valid_labels_pred == valid_labels).float().mean().item()
-    print(f"{scheme} k-NN accuracy (k={k_neighbors}): {accuracy * 100:.2f}%")
+    print(
+        f"{global_configs.scheme} k-NN accuracy (k={global_configs.k_neighbors}): {accuracy * 100:.2f}%"
+    )
+
+
+def create_dataloaders(
+    global_configs,
+    restore_configs,
+    clean_train_embeddings,
+    corrupt_train_embeddings,
+    clean_valid_embeddings,
+    corrupt_valid_embeddings,
+):
+    # create dataloaders
+    train_ds = TensorDataset(corrupt_train_embeddings, clean_train_embeddings)
+    val_ds = TensorDataset(corrupt_valid_embeddings, clean_valid_embeddings)
+    train_loader = DataLoader(
+        train_ds, batch_size=global_configs.batch_size, shuffle=True, drop_last=False
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=global_configs.batch_size, shuffle=False, drop_last=False
+    )
+    return train_loader, val_loader
+
+
+def train(
+    restore_configs,
+    train_loader,
+    val_loader,
+    device,
+):
+    in_dim = 768
+    out_dim = 768
+    model = ResidualMLP(
+        in_dim,
+        restore_configs.hidden_dims,
+        out_dim,
+        num_layers=restore_configs.num_layers,
+        dropout=restore_configs.dropout,
+    ).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=1e-3,
+        weight_decay=1e-4,
+    )
+    num_epochs = restore_configs.epochs
+    cosine_weight = restore_configs.cosine_weight
+    # training loop
+    losses = {"train": [], "val": []}
+    for epoch in tqdm(range(num_epochs)):
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            y_pred = model(xb)
+            # loss = MSE + cosine_weight * (1 - cosine_similiaty)
+            mse_loss = F.mse_loss(y_pred, yb)
+            cosine_loss = 1.0 - F.cosine_similarity(y_pred, yb, dim=-1, eps=1e-8).mean()
+            loss = mse_loss + cosine_weight * cosine_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            print(f"Epoch {epoch} loss: {loss.item()}")
+            losses["train"].append(loss.item())
+
+    return model, losses
+
+
+def evaluate(model, train_loader, val_loader, device):
+    yhat_train = []
+    for xb, yb in train_loader:
+        xb = xb.to(device)
+        yhat_train.append(model(xb).cpu())
+    train_pred = torch.cat(yhat_train, dim=0)
+
+    yhat_val = []
+    for xb, yb in val_loader:
+        xb = xb.to(device)
+        yhat_val.append(model(xb).cpu())
+    val_pred = torch.cat(yhat_val, dim=0)
+
+    return train_pred, val_pred
+
+
+def main():
+    global_configs, restore_configs = set_up()
+    reconstruct(global_configs, restore_configs)
 
 
 if __name__ == "__main__":
-    reconstruct()
+    main()
