@@ -4,8 +4,6 @@ from torch.utils.data import DataLoader
 from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
 from typing import List, Optional, Tuple, Union
-from utils.model_utils import instantiate_from_config
-from utils.train_utils import parse_configs
 from restore_methods import (
     fit_ridge_linear_map,
     linear_map_predict,
@@ -17,6 +15,8 @@ import numpy as np
 import random
 import torch
 import torch.nn.functional as F
+from transformers import AutoImageProcessor, AutoModel
+import math
 
 
 def set_up():
@@ -120,7 +120,7 @@ class ReconstructConfigs:
     epochs: Optional[int]
 
 
-def get_embeddings_n_labels(configs, corruption=False):
+def get_embeddings_n_labels(configs, encoder_bundle, corruption=False):
     if corruption:
         scheme = configs.scheme
     else:
@@ -132,9 +132,8 @@ def get_embeddings_n_labels(configs, corruption=False):
         batch_size=configs.batch_size,
         num_workers=configs.num_workers,
     )
-    rae = load_rae(configs.config_path, configs.ckpt_path, configs.device)
     train_embeddings, train_labels = extract_features(
-        rae,
+        encoder_bundle,
         train_loader,
         scheme,
         configs.device,
@@ -143,7 +142,7 @@ def get_embeddings_n_labels(configs, corruption=False):
         max_items=None,
     )
     valid_embeddings, valid_labels = extract_features(
-        rae,
+        encoder_bundle,
         valid_loader,
         scheme,
         configs.device,
@@ -157,54 +156,27 @@ def get_embeddings_n_labels(configs, corruption=False):
     }
 
 
-def load_rae(config_path: str, ckpt_path: Optional[str], device: torch.device):
-    (stage1_cfg, *_rest) = parse_configs(config_path)
-    repo_root = Path(__file__).resolve().parents[1]
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
-    # Resolve local file references in the config if they exist; otherwise disable them.
-    def resolve_if_exists(path_str: Optional[str]) -> Optional[str]:
-        if path_str is None:
-            return None
-        candidate = Path(path_str)
-        if not candidate.is_absolute():
-            candidate = repo_root / candidate
-        return str(candidate) if candidate.exists() else None
 
-    try:
-        if stage1_cfg.params.encoder_cls in ("Dinov3withNorm", "Dinov3WithNorm"):
-            stage1_cfg.params.encoder_params.normalize = False
-    except Exception:
-        pass
-
-    try:
-        dec_path = resolve_if_exists(stage1_cfg.params.get("pretrained_decoder_path"))
-        stage1_cfg.params.pretrained_decoder_path = dec_path
-    except Exception:
-        pass
-    try:
-        norm_path = resolve_if_exists(stage1_cfg.params.get("normalization_stat_path"))
-        stage1_cfg.params.normalization_stat_path = norm_path
-    except Exception:
-        pass
-
-    rae = instantiate_from_config(stage1_cfg).to(device)
-    rae.eval()
-
-    if ckpt_path is not None:
-        ckpt_file = Path(ckpt_path)
-        if not ckpt_file.is_absolute():
-            ckpt_file = repo_root / ckpt_file
-        if ckpt_file.exists():
-            state = torch.load(ckpt_file, map_location="cpu")
-            rae.load_state_dict(state, strict=False)
-        else:
-            print(f"[WARN] Stage-1 checkpoint not found at {ckpt_file}, skipping load.")
-    return rae
+def load_dino_encoder(device: torch.device, model_name: str = "facebook/dinov2-base"):
+    processor = AutoImageProcessor.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
+    model.to(device)
+    model.eval()
+    dino_mean = torch.tensor(processor.image_mean).view(1, 3, 1, 1)
+    dino_std = torch.tensor(processor.image_std).view(1, 3, 1, 1)
+    return {
+        "model": model,
+        "mean": dino_mean,
+        "std": dino_std,
+    }
 
 
 @torch.no_grad()
 def extract_features(
-    rae,
+    encoder_bundle,
     loader: DataLoader,
     scheme: str,
     device: torch.device,
@@ -215,15 +187,33 @@ def extract_features(
     if noise_std is None and scheme.lower() == "gaussian":
         raise ValueError(f"`noise_std` must be defined for the scheme {scheme}")
 
+    model = encoder_bundle["model"]
+    dino_mean = encoder_bundle["mean"].to(device)
+    dino_std = encoder_bundle["std"].to(device)
+    imagenet_mean = IMAGENET_MEAN.to(device)
+    imagenet_std = IMAGENET_STD.to(device)
+
     feats: List[torch.Tensor] = []
     labels: List[torch.Tensor] = []
     n_seen = 0
     for images, y in tqdm(loader):
         images = images.to(device, non_blocking=True)
 
-        z = rae.encode(images)  # (B, C, H, W)
+        # Undo Imagenet normalization and apply DINO-specific normalization
+        images = images * imagenet_std + imagenet_mean
+        images = images.clamp(0.0, 1.0)
+        pixel_values = (images - dino_mean) / dino_std
+
+        outputs = model(pixel_values=pixel_values)
+        hidden = outputs.last_hidden_state  # (B, N+1, C)
+        hidden = hidden[:, 1:, :]  # drop CLS
+        b, n, c = hidden.shape
+        hw = int(math.sqrt(n))
+        if hw * hw != n:
+            raise ValueError(f"Unexpected token count {n}, cannot reshape to square.")
+        z = hidden.transpose(1, 2).reshape(b, c, hw, hw)
         z = z.mean(dim=(-2, -1))  # (B, C)
-        z = F.normalize(z, dim=-1)  # (B, C), unit norm
+        z = F.normalize(z, dim=-1)
 
         if scheme.lower() == "gaussian" and noise_std > 0:
             eps = torch.randn(
@@ -304,8 +294,11 @@ def worker_init_fn(worker_id):
 
 
 def reconstruct(global_configs: GlobalConfigs, restore_configs: ReconstructConfigs):
-    clean_embeds_n_labels = get_embeddings_n_labels(global_configs)
-    corrupt_embeds_n_labels = get_embeddings_n_labels(global_configs, corruption=True)
+    encoder_bundle = load_dino_encoder(global_configs.device)
+    clean_embeds_n_labels = get_embeddings_n_labels(global_configs, encoder_bundle)
+    corrupt_embeds_n_labels = get_embeddings_n_labels(
+        global_configs, encoder_bundle, corruption=True
+    )
 
     clean_train_embeddings = clean_embeds_n_labels["embeddings"]["train"]
     corrupt_train_embeddings = corrupt_embeds_n_labels["embeddings"]["train"]
