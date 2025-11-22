@@ -409,39 +409,77 @@ def train(
         weight_decay=1e-4,
     )
     num_epochs = restore_configs.epochs
-    cosine_weight = restore_configs.cosine_weight
-    # training loop
     losses = {"train": [], "val": []}
-    for epoch in tqdm(range(num_epochs)):
+    best_state = None
+    best_val = float("inf")
+    best_epoch = -1
+
+    for epoch in tqdm(range(num_epochs), desc="Training epochs"):
+        model.train()
+        running_loss = 0.0
+        n_samples = 0
         for xb, yb in train_loader:
             xb = xb.to(device)
             yb = yb.to(device)
             y_pred = F.normalize(model(xb), dim=-1)
-            mse_loss = F.mse_loss(y_pred, yb)
-            loss = mse_loss
+            loss = F.mse_loss(y_pred, yb)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            print(f"Epoch {epoch} loss: {loss.item()}")
-            losses["train"].append(loss.item())
+
+            running_loss += loss.item() * xb.size(0)
+            n_samples += xb.size(0)
+        epoch_train_loss = running_loss / max(n_samples, 1)
+        losses["train"].append(epoch_train_loss)
+
+        model.eval()
+        val_loss = 0.0
+        val_samples = 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+                preds = F.normalize(model(xb), dim=-1)
+                batch_loss = F.mse_loss(preds, yb)
+                val_loss += batch_loss.item() * xb.size(0)
+                val_samples += xb.size(0)
+        epoch_val_loss = val_loss / max(val_samples, 1)
+        losses["val"].append(epoch_val_loss)
+        print(
+            f"Epoch {epoch+1}/{num_epochs} - train_loss: {epoch_train_loss:.6f} - val_loss: {epoch_val_loss:.6f}"
+        )
+
+        if epoch_val_loss < best_val:
+            best_val = epoch_val_loss
+            best_state = model.state_dict()
+            best_epoch = epoch
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    losses["best_epoch"] = best_epoch
+    losses["best_val_loss"] = best_val
 
     return model, losses
 
 
 def evaluate(model, train_loader, val_loader, device):
+    model.eval()
     yhat_train = []
-    for xb, yb in train_loader:
-        xb = xb.to(device)
-        preds = F.normalize(model(xb), dim=-1)
-        yhat_train.append(preds.cpu())
+    with torch.no_grad():
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            preds = F.normalize(model(xb), dim=-1)
+            yhat_train.append(preds.cpu())
     train_pred = torch.cat(yhat_train, dim=0)
 
     yhat_val = []
-    for xb, yb in val_loader:
-        xb = xb.to(device)
-        preds = F.normalize(model(xb), dim=-1)
-        yhat_val.append(preds.cpu())
+    with torch.no_grad():
+        for xb, yb in val_loader:
+            xb = xb.to(device)
+            preds = F.normalize(model(xb), dim=-1)
+            yhat_val.append(preds.cpu())
     val_pred = torch.cat(yhat_val, dim=0)
 
     return train_pred, val_pred
