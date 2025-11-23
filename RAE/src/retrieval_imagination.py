@@ -2,8 +2,8 @@
 """
 Retrieval imagination experiment:
     1. Apply fragment corruption (crop/occlusion/gaussian) to validation images.
-    2. Reconstruct images with a Stage-1 RAE to obtain x_hat.
-    3. Embed fragments, reconstructions, and clean images with the RAE encoder.
+    2. Reconstruct clean embeddings with a small ResidualMLP trained on DINO features.
+    3. Embed fragments, reconstructions, and clean images with the frozen DINO encoder.
     4. Retrieve top-k nearest clean training images in embedding space.
     5. Report precision@k and dump visualization metadata for Jupyter analysis.
 """
@@ -24,7 +24,8 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 
 from corruption import RandomAreaDownUp, RandomSquareOccluder
-from knn_restore import load_rae
+from knn_restore import load_dino_encoder
+from restore_methods import ResidualMLP
 
 
 def default_data_root(size: str) -> Path:
@@ -119,18 +120,50 @@ class ImagenetteRetrievalDataset(Dataset):
         return item
 
 
-@torch.no_grad()
-def pooled_embeddings(rae, images: torch.Tensor) -> torch.Tensor:
-    latents = rae.encode(images)
-    pooled = latents.mean(dim=(-2, -1))
-    return F.normalize(pooled, dim=-1)
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
+
+def load_residual_mlp(
+    ckpt_path: Path,
+    hidden_dims: int,
+    num_layers: int,
+    dropout: float,
+    device: torch.device,
+):
+    model = ResidualMLP(
+        in_dim=768,
+        hidden_dims=hidden_dims,
+        out_dim=768,
+        num_layers=num_layers,
+        dropout=dropout,
+    ).to(device)
+    state = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(state, dict) and "model" in state:
+        state = state["model"]
+    model.load_state_dict(state)
+    model.eval()
+    return model
 
 
 @torch.no_grad()
-def reconstruct_images(rae, fragments: torch.Tensor) -> torch.Tensor:
-    latents = rae.encode(fragments)
-    recon = rae.decode(latents)
-    return recon.clamp(0.0, 1.0)
+def pooled_embeddings(feature_encoder, images: torch.Tensor) -> torch.Tensor:
+    model = feature_encoder["model"]
+    pixel_values = (images - IMAGENET_MEAN.to(images.device)) / IMAGENET_STD.to(images.device)
+    outputs = model(pixel_values=pixel_values)
+    hidden = outputs.last_hidden_state[:, 1:, :]
+    b, n, c = hidden.shape
+    hw = int(n**0.5)
+    if hw * hw != n:
+        raise ValueError(f"Unexpected token count {n}, cannot reshape to square.")
+    z = hidden.transpose(1, 2).reshape(b, c, hw, hw)
+    z = z.mean(dim=(-2, -1))
+    return F.normalize(z, dim=-1)
+
+
+@torch.no_grad()
+def reconstruct_features(mlp: ResidualMLP, feats: torch.Tensor) -> torch.Tensor:
+    return F.normalize(mlp(feats), dim=-1)
 
 
 def stack_batches(chunks: List[torch.Tensor], device: torch.device) -> torch.Tensor:
@@ -141,7 +174,7 @@ def stack_batches(chunks: List[torch.Tensor], device: torch.device) -> torch.Ten
 
 
 def build_index(
-    rae,
+    feature_encoder,
     loader: DataLoader,
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
@@ -150,7 +183,7 @@ def build_index(
     paths: List[str] = []
     for batch in tqdm(loader, desc="Indexing train embeddings"):
         clean = batch["clean"].to(device)
-        feats = pooled_embeddings(rae, clean)
+        feats = pooled_embeddings(feature_encoder, clean)
         feat_chunks.append(feats)
         label_chunks.append(batch["label"].to(device))
         paths.extend(batch["path"])
@@ -205,7 +238,8 @@ def format_retrievals(
 
 
 def evaluate_queries(
-    rae,
+    feature_encoder,
+    mlp_model: ResidualMLP,
     loader: DataLoader,
     index_feats: torch.Tensor,
     index_labels: torch.Tensor,
@@ -227,10 +261,9 @@ def evaluate_queries(
         fragment = batch["fragment"].to(device)
         labels = batch["label"].to(device)
 
-        clean_feats = pooled_embeddings(rae, clean)
-        fragment_feats = pooled_embeddings(rae, fragment)
-        recon = reconstruct_images(rae, fragment)
-        recon_feats = pooled_embeddings(rae, recon)
+        clean_feats = pooled_embeddings(feature_encoder, clean)
+        fragment_feats = pooled_embeddings(feature_encoder, fragment)
+        recon_feats = reconstruct_features(mlp_model, fragment_feats)
 
         eval_pack = {
             "fragment": fragment_feats,
@@ -257,11 +290,9 @@ def evaluate_queries(
                 }
                 base_name = f"sample_{total + i:05d}"
                 fragment_png = vis_dir / f"{base_name}_fragment.png"
-                recon_png = vis_dir / f"{base_name}_recon.png"
                 tensor_to_png(batch["fragment"][i], fragment_png)
-                tensor_to_png(recon[i].cpu(), recon_png)
                 rec["fragment_png"] = fragment_png.as_posix()
-                rec["recon_png"] = recon_png.as_posix()
+                rec["recon_png"] = None
                 rec["retrievals"] = {}
                 for variant, (top_idx, top_scores) in retrieval_cache.items():
                     rec["retrievals"][variant] = format_retrievals(
@@ -288,8 +319,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Retrieval imagination: compare fragment vs reconstruction retrieval."
     )
-    parser.add_argument("--config", required=True, help="Path to stage-1 config YAML.")
-    parser.add_argument("--ckpt", help="Optional stage-1 checkpoint path.")
     parser.add_argument("--device", default=None, help="Torch device (default: auto).")
     parser.add_argument("--data-size", default="320px", choices=["full", "320px", "160px"])
     parser.add_argument("--batch-size", type=int, default=32)
@@ -307,6 +336,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-queries", type=int, default=None, help="Limit queries for quick tests.")
     parser.add_argument("--results-dir", type=Path, default=Path("results/retrieval_imagination"))
     parser.add_argument("--num-visualize", type=int, default=8, help="How many samples to dump for notebook.")
+    parser.add_argument("--mlp-ckpt", type=Path, required=True, help="Path to a trained ResidualMLP checkpoint.")
+    parser.add_argument("--mlp-hidden-dim", type=int, default=128, help="Hidden dimension for the ResidualMLP.")
+    parser.add_argument("--mlp-num-layers", type=int, default=3, help="Number of layers in the ResidualMLP.")
+    parser.add_argument("--mlp-dropout", type=float, default=0.1, help="Dropout for the ResidualMLP.")
     return parser.parse_args()
 
 
@@ -357,10 +390,18 @@ def main() -> None:
         pin_memory=True,
     )
 
-    rae = load_rae(args.config, args.ckpt, device)
-    index_feats, index_labels, train_paths = build_index(rae, train_loader, device)
+    feature_encoder = load_dino_encoder(device)
+    mlp_model = load_residual_mlp(
+        args.mlp_ckpt,
+        args.mlp_hidden_dim,
+        args.mlp_num_layers,
+        args.mlp_dropout,
+        device,
+    )
+    index_feats, index_labels, train_paths = build_index(feature_encoder, train_loader, device)
     metrics, records, num_processed = evaluate_queries(
-        rae,
+        feature_encoder,
+        mlp_model,
         val_loader,
         index_feats,
         index_labels,
@@ -380,8 +421,10 @@ def main() -> None:
         "corrupt_range": args.corrupt_range,
         "gaussian_std": args.gaussian_std,
         "precision": metrics,
-        "config": str(args.config),
-        "ckpt": str(args.ckpt) if args.ckpt else None,
+        "mlp_ckpt": args.mlp_ckpt.as_posix(),
+        "mlp_hidden_dim": args.mlp_hidden_dim,
+        "mlp_num_layers": args.mlp_num_layers,
+        "mlp_dropout": args.mlp_dropout,
         "results_dir": args.results_dir.as_posix(),
     }
     metrics_path = args.results_dir / "metrics.json"
