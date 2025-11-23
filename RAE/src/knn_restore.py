@@ -15,7 +15,7 @@ import numpy as np
 import random
 import torch
 import torch.nn.functional as F
-from transformers import AutoImageProcessor, AutoModel
+from transformers import AutoModel
 import math
 
 
@@ -156,21 +156,12 @@ def get_embeddings_n_labels(configs, encoder_bundle, corruption=False):
     }
 
 
-IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-
-
 def load_dino_encoder(device: torch.device, model_name: str = "facebook/dinov2-base"):
-    processor = AutoImageProcessor.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name)
     model.to(device)
     model.eval()
-    dino_mean = torch.tensor(processor.image_mean).view(1, 3, 1, 1)
-    dino_std = torch.tensor(processor.image_std).view(1, 3, 1, 1)
     return {
         "model": model,
-        "mean": dino_mean,
-        "std": dino_std,
     }
 
 
@@ -188,10 +179,6 @@ def extract_features(
         raise ValueError(f"`noise_std` must be defined for the scheme {scheme}")
 
     model = encoder_bundle["model"]
-    dino_mean = encoder_bundle["mean"].to(device)
-    dino_std = encoder_bundle["std"].to(device)
-    imagenet_mean = IMAGENET_MEAN.to(device)
-    imagenet_std = IMAGENET_STD.to(device)
 
     feats: List[torch.Tensor] = []
     labels: List[torch.Tensor] = []
@@ -199,10 +186,7 @@ def extract_features(
     for images, y in tqdm(loader):
         images = images.to(device, non_blocking=True)
 
-        # Undo Imagenet normalization and apply DINO-specific normalization
-        images = images * imagenet_std + imagenet_mean
-        images = images.clamp(0.0, 1.0)
-        pixel_values = (images - dino_mean) / dino_std
+        pixel_values = images
 
         outputs = model(pixel_values=pixel_values)
         hidden = outputs.last_hidden_state  # (B, N+1, C)
