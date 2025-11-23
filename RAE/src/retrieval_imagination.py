@@ -126,14 +126,14 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
 def load_residual_mlp(
     ckpt_path: Path,
-    hidden_dims: int,
+    hidden_dim: int,
     num_layers: int,
     dropout: float,
     device: torch.device,
 ):
     model = ResidualMLP(
         in_dim=768,
-        hidden_dims=hidden_dims,
+        hidden_dim=hidden_dim,
         out_dim=768,
         num_layers=num_layers,
         dropout=dropout,
@@ -337,7 +337,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results-dir", type=Path, default=Path("results/retrieval_imagination"))
     parser.add_argument("--num-visualize", type=int, default=8, help="How many samples to dump for notebook.")
     parser.add_argument("--mlp-ckpt", type=Path, required=True, help="Path to a trained ResidualMLP checkpoint.")
-    parser.add_argument("--mlp-hidden-dim", type=int, default=128, help="Hidden dimension for the ResidualMLP.")
+    parser.add_argument("--mlp-hidden-dim", type=int, default=2048, help="Hidden dimension for the ResidualMLP.")
     parser.add_argument("--mlp-num-layers", type=int, default=3, help="Number of layers in the ResidualMLP.")
     parser.add_argument("--mlp-dropout", type=float, default=0.1, help="Dropout for the ResidualMLP.")
     return parser.parse_args()
