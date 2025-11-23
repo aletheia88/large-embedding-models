@@ -1,5 +1,4 @@
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from torch.utils.data import DataLoader
 from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
@@ -20,9 +19,6 @@ import math
 
 
 def set_up():
-    repo_root = Path(__file__).resolve().parents[1]
-    config_file = repo_root / "configs/stage1/pretrained/DINOv2-B.yaml"
-    ckpt = None  # optional stage-1 checkpoint (not required for encoding)
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     batch_size = 64
     # seeds = [1912, 1985, 1976, 2001, 2024]
@@ -38,8 +34,6 @@ def set_up():
     generator = torch.Generator(device=device).manual_seed(seed)
 
     global_configs = GlobalConfigs(
-        config_file=str(config_file),
-        ckpt=None if ckpt is None else str(ckpt),
         batch_size=batch_size,
         k_neighbors=k_neighbors,
         scheme=scheme,
@@ -70,8 +64,6 @@ def set_up():
 
 @dataclass
 class GlobalConfigs:
-    config_file: str
-    ckpt: Optional[str]
     batch_size: int
     k_neighbors: int
     scheme: str
@@ -81,30 +73,6 @@ class GlobalConfigs:
     seed: int
     num_workers: int
     generator: torch.Generator
-    config_root: Path = field(
-        default_factory=lambda: Path(__file__).resolve().parents[1] / "configs"
-    )
-    model_root: Path = field(
-        default_factory=lambda: Path(__file__).resolve().parents[1] / "models"
-    )
-
-    def __post_init__(self):
-        # normalize roots
-        self.config_root = Path(self.config_root).expanduser()
-        self.model_root = Path(self.model_root).expanduser()
-
-        # config path: if relative, join to root; if absolute, keep as-is
-        cf = Path(self.config_file)
-        self.config_path = cf if cf.is_absolute() else (self.config_root / cf)
-        self.config_path = self.config_path.resolve()
-
-        # model path: if relative, join to root; if absolute, keep as-is
-        if self.ckpt is not None:
-            ck = Path(self.ckpt)
-            self.ckpt_path = ck if ck.is_absolute() else (self.model_root / ck)
-            self.ckpt_path = self.ckpt_path.resolve()
-        else:
-            self.ckpt_path = None
 
 
 @dataclass
