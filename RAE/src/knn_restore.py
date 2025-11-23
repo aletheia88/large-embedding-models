@@ -52,18 +52,16 @@ def set_up():
     )
     lam = None  # lam = 1 for "ridge" regressor method
     method = "mlp"  # options: "ridge", "mlp"
-    hidden_dims = 128
+    hidden_dims = 2048
     num_layers = 3
     dropout = 0.1
-    cosine_weight = 1
-    epochs = 1
+    epochs = 5
     restore_configs = ReconstructConfigs(
         method,
         lam,
         hidden_dims,
         num_layers,
         dropout,
-        cosine_weight,
         epochs,
     )
 
@@ -116,7 +114,6 @@ class ReconstructConfigs:
     hidden_dims: Optional[int]
     num_layers: Optional[int]
     dropout: Optional[float]
-    cosine_weight: float
     epochs: Optional[int]
 
 
