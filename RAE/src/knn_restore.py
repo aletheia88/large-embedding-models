@@ -17,13 +17,12 @@ from restore_methods import (
 )
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
-from transformers import AutoModel, CLIPVisionModelWithProjection
+from transformers import AutoModel, CLIPImageProcessor, CLIPVisionModelWithProjection
+from torchvision.transforms.functional import to_pil_image
 
 
 IMAGENET_MEAN = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
 IMAGENET_STD = torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
-CLIP_MEAN = torch.tensor((0.48145466, 0.4578275, 0.40821073)).view(1, 3, 1, 1)
-CLIP_STD = torch.tensor((0.26862954, 0.26130258, 0.27577711)).view(1, 3, 1, 1)
 
 
 def set_up():
@@ -68,15 +67,23 @@ def set_up():
     )
 
     encoder_type = "clip"  # options: "dino", "clip"
-    encoder_model_name = (
-        "openai/clip-vit-large-patch14"
-        if encoder_type == "clip"
-        else "facebook/dinov2-base"
-    )
+    if encoder_type == "clip":
+        encoder_model_name = "sd2-community/stable-diffusion-2-1-unclip-small"
+        model_subfolder = "image_encoder"
+        processor_subfolder = "feature_extractor"
+        normalize_features = False
+    else:
+        encoder_model_name = "facebook/dinov2-base"
+        model_subfolder = None
+        processor_subfolder = None
+        normalize_features = True
     encoder_configs = EncoderConfigs(
         encoder_type=encoder_type,
         model_name=encoder_model_name,
         image_size=224,
+        model_subfolder=model_subfolder,
+        processor_subfolder=processor_subfolder,
+        normalize_features=normalize_features,
     )
 
     unclip_configs = UnCLIPConfigs(
@@ -123,6 +130,9 @@ class EncoderConfigs:
     encoder_type: str  # "dino" or "clip"
     model_name: str
     image_size: int = 224
+    model_subfolder: Optional[str] = None
+    processor_subfolder: Optional[str] = None
+    normalize_features: bool = True
 
 
 @dataclass
@@ -183,8 +193,21 @@ def load_encoder(encoder_configs: EncoderConfigs, device: torch.device):
     if encoder_type == "dino":
         model = AutoModel.from_pretrained(model_name)
         feature_dim = getattr(model.config, "hidden_size", None)
+        processor = None
     elif encoder_type == "clip":
-        model = CLIPVisionModelWithProjection.from_pretrained(model_name)
+        model_kwargs = {}
+        if encoder_configs.model_subfolder:
+            model_kwargs["subfolder"] = encoder_configs.model_subfolder
+        model = CLIPVisionModelWithProjection.from_pretrained(
+            model_name, **model_kwargs
+        )
+
+        processor_kwargs = {}
+        if encoder_configs.processor_subfolder:
+            processor_kwargs["subfolder"] = encoder_configs.processor_subfolder
+        processor = CLIPImageProcessor.from_pretrained(
+            model_name, **processor_kwargs
+        )
         feature_dim = getattr(model.config, "projection_dim", None)
     else:
         raise ValueError(f"Unsupported encoder_type='{encoder_configs.encoder_type}'")
@@ -202,28 +225,20 @@ def load_encoder(encoder_configs: EncoderConfigs, device: torch.device):
         "type": encoder_type,
         "feature_dim": feature_dim,
         "image_size": encoder_configs.image_size,
+        "processor": processor,
+        "normalize": encoder_configs.normalize_features,
     }
 
 
-def prepare_clip_pixel_values(images: torch.Tensor, target_size: int) -> torch.Tensor:
-    device = images.device
-    dtype = images.dtype
-    mean = IMAGENET_MEAN.to(device=device, dtype=dtype)
-    std = IMAGENET_STD.to(device=device, dtype=dtype)
-    clip_mean = CLIP_MEAN.to(device=device, dtype=dtype)
-    clip_std = CLIP_STD.to(device=device, dtype=dtype)
-
-    pixel_values = images * std + mean
-    pixel_values = pixel_values.clamp(0.0, 1.0)
-    if pixel_values.shape[-1] != target_size or pixel_values.shape[-2] != target_size:
-        pixel_values = F.interpolate(
-            pixel_values,
-            size=(target_size, target_size),
-            mode="bicubic",
-            align_corners=False,
-        )
-    pixel_values = (pixel_values - clip_mean) / clip_std
-    return pixel_values
+def prepare_unclip_pixel_values(
+    images: torch.Tensor, processor: CLIPImageProcessor
+) -> torch.Tensor:
+    mean = IMAGENET_MEAN.to(device=images.device, dtype=images.dtype)
+    std = IMAGENET_STD.to(device=images.device, dtype=images.dtype)
+    images = (images * std + mean).clamp(0.0, 1.0)
+    pil_batch = [to_pil_image(img.cpu()) for img in images]
+    pixel_values = processor(images=pil_batch, return_tensors="pt").pixel_values
+    return pixel_values.to(images.device)
 
 
 @torch.no_grad()
@@ -243,6 +258,8 @@ def extract_features(
     encoder_type = encoder_bundle["type"]
     feature_dim = encoder_bundle["feature_dim"]
     image_size = encoder_bundle.get("image_size", 224)
+    normalize_feats = encoder_bundle.get("normalize", True)
+    processor = encoder_bundle.get("processor")
 
     feats: List[torch.Tensor] = []
     labels: List[torch.Tensor] = []
@@ -251,7 +268,9 @@ def extract_features(
         images = images.to(device, non_blocking=True)
 
         if encoder_type == "clip":
-            pixel_values = prepare_clip_pixel_values(images, image_size)
+            if processor is None:
+                raise ValueError("CLIP encoder requires an associated processor.")
+            pixel_values = prepare_unclip_pixel_values(images, processor)
             outputs = model(pixel_values=pixel_values)
             z = outputs.image_embeds
         elif encoder_type == "dino":
@@ -275,15 +294,17 @@ def extract_features(
                 f"Embedding dimension mismatch: expected {feature_dim}, got {z.shape[-1]}"
             )
 
-        z = F.normalize(z, dim=-1)
+        if normalize_feats:
+            z = F.normalize(z, dim=-1)
 
         if scheme.lower() == "gaussian" and noise_std > 0:
             eps = torch.randn(
                 z.shape, device=z.device, dtype=z.dtype, generator=generator
             )
             z = z + noise_std * eps
-            # renormalize after noise
-            z = F.normalize(z, dim=-1)
+            if normalize_feats:
+                # renormalize after noise
+                z = F.normalize(z, dim=-1)
 
         feats.append(z.cpu())
         labels.append(y.cpu())
@@ -394,16 +415,22 @@ def reconstruct(
             corrupt_valid_embeddings,
         )
         feature_dim = encoder_bundle["feature_dim"]
+        normalize_outputs = encoder_bundle.get("normalize", True)
         model, losses = train(
             restore_configs,
             train_loader,
             val_loader,
             global_configs.device,
             feature_dim,
+            normalize_outputs,
         )
         model.eval()
         train_embeds_pred, valid_embeds_pred = evaluate(
-            model, train_eval_loader, val_loader, global_configs.device
+            model,
+            train_eval_loader,
+            val_loader,
+            global_configs.device,
+            normalize_outputs,
         )
         print(f"pred train embeds: {train_embeds_pred.shape}")
         print(f"pred valid embeds: {valid_embeds_pred.shape}")
@@ -466,6 +493,7 @@ def train(
     val_loader,
     device,
     feature_dim: int,
+    normalize_outputs: bool,
 ):
     in_dim = feature_dim
     out_dim = feature_dim
@@ -494,7 +522,9 @@ def train(
         for xb, yb in train_loader:
             xb = xb.to(device)
             yb = yb.to(device)
-            y_pred = F.normalize(model(xb), dim=-1)
+            y_pred = model(xb)
+            if normalize_outputs:
+                y_pred = F.normalize(y_pred, dim=-1)
             loss = F.mse_loss(y_pred, yb)
 
             optimizer.zero_grad()
@@ -513,7 +543,9 @@ def train(
             for xb, yb in val_loader:
                 xb = xb.to(device)
                 yb = yb.to(device)
-                preds = F.normalize(model(xb), dim=-1)
+                preds = model(xb)
+                if normalize_outputs:
+                    preds = F.normalize(preds, dim=-1)
                 batch_loss = F.mse_loss(preds, yb)
                 val_loss += batch_loss.item() * xb.size(0)
                 val_samples += xb.size(0)
@@ -537,13 +569,15 @@ def train(
     return model, losses
 
 
-def evaluate(model, train_eval_loader, val_loader, device):
+def evaluate(model, train_eval_loader, val_loader, device, normalize_outputs: bool):
     model.eval()
     yhat_train = []
     with torch.no_grad():
         for xb, yb in train_eval_loader:
             xb = xb.to(device)
-            preds = F.normalize(model(xb), dim=-1)
+            preds = model(xb)
+            if normalize_outputs:
+                preds = F.normalize(preds, dim=-1)
             yhat_train.append(preds.cpu())
     train_pred = torch.cat(yhat_train, dim=0)
 
@@ -551,7 +585,9 @@ def evaluate(model, train_eval_loader, val_loader, device):
     with torch.no_grad():
         for xb, yb in val_loader:
             xb = xb.to(device)
-            preds = F.normalize(model(xb), dim=-1)
+            preds = model(xb)
+            if normalize_outputs:
+                preds = F.normalize(preds, dim=-1)
             yhat_val.append(preds.cpu())
     val_pred = torch.cat(yhat_val, dim=0)
 
