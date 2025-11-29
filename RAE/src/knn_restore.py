@@ -34,10 +34,11 @@ def set_up():
     seed = 1912
     num_workers = 4
     # schemes = ["baseline", "crop", "occlude", "gaussian"]
-    scheme = "occlude"
+    scheme = "mix"  # options: "baseline", "occlude", "mix", ...
     corrupt_range = (0.50, 0.70)
     k_neighbors = 25
     noise_std = None
+    mix_alpha = 0.5
 
     seed_everything(seed)
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -52,11 +53,12 @@ def set_up():
         seed=seed,
         num_workers=num_workers,
         generator=generator,
+        mix_alpha=mix_alpha,
     )
     # lam = 1 for "ridge" regressor method
     lam = None
     # options: "ridge", "mlp", "hopfield", "hopfield-associate"
-    method = "hopfield-associate"
+    method = "mlp"
     hidden_dims = 2048
     num_layers = 3
     dropout = 0.1
@@ -119,6 +121,7 @@ class GlobalConfigs:
     seed: int
     num_workers: int
     generator: torch.Generator
+    mix_alpha: Optional[float] = None
 
 
 @dataclass
@@ -186,9 +189,28 @@ def get_embeddings_n_labels(configs, encoder_bundle, corruption=False):
         noise_std=configs.noise_std,
         max_items=None,
     )
+    mix_pairs = {"train": None, "valid": None}
+    mix_perm = {"train": None, "valid": None}
+    if corruption and scheme == "mix":
+        alpha = configs.mix_alpha if configs.mix_alpha is not None else 0.5
+        gen_train = torch.Generator().manual_seed(configs.seed)
+        train_embeddings, pair_train, perm_train = apply_mix_embeddings(
+            train_embeddings, train_labels, alpha, gen_train
+        )
+        mix_pairs["train"] = pair_train
+        mix_perm["train"] = perm_train
+
+        gen_valid = torch.Generator().manual_seed(configs.seed + 1)
+        valid_embeddings, pair_valid, perm_valid = apply_mix_embeddings(
+            valid_embeddings, valid_labels, alpha, gen_valid
+        )
+        mix_pairs["valid"] = pair_valid
+        mix_perm["valid"] = perm_valid
     return {
         "embeddings": {"train": train_embeddings, "valid": valid_embeddings},
         "labels": {"train": train_labels, "valid": valid_labels},
+        "mix_pairs": mix_pairs,
+        "mix_perm": mix_perm,
     }
 
 
@@ -266,7 +288,6 @@ def extract_features(
     image_size = encoder_bundle.get("image_size", 224)
     normalize_feats = encoder_bundle.get("normalize", True)
     processor = encoder_bundle.get("processor")
-
     feats: List[torch.Tensor] = []
     labels: List[torch.Tensor] = []
     n_seen = 0
@@ -323,6 +344,34 @@ def extract_features(
     labels = torch.cat(labels, dim=0)
 
     return feats, labels
+
+
+def apply_mix_embeddings(
+    embeddings: torch.Tensor,
+    labels: torch.Tensor,
+    alpha: float,
+    generator: torch.Generator,
+):
+    labels = labels.clone()
+    embeddings = embeddings.clone()
+    unique_labels = torch.unique(labels, sorted=True)
+    perm = torch.empty_like(labels, dtype=torch.long)
+
+    class_to_indices: List[torch.Tensor] = []
+    for lbl in unique_labels:
+        idxs = torch.nonzero(labels == lbl, as_tuple=False).flatten()
+        idxs = idxs[torch.randperm(len(idxs), generator=generator)]
+        class_to_indices.append(idxs)
+
+    for i, idxs in enumerate(class_to_indices):
+        next_idxs = class_to_indices[(i + 1) % len(class_to_indices)]
+        repeat = (len(idxs) + len(next_idxs) - 1) // len(next_idxs)
+        expanded = next_idxs.repeat(repeat)[: len(idxs)]
+        perm[idxs] = expanded
+
+    mixed = alpha * embeddings + (1 - alpha) * embeddings[perm]
+    pair_labels = torch.stack([labels, labels[perm]], dim=1)
+    return mixed, pair_labels, perm
 
 
 def knn_predict(
@@ -601,7 +650,7 @@ def evaluate(
     val_loader,
     device,
     normalize_outputs: bool,
-    restore_method: str,
+    restore_method: str = "mlp",
 ):
     model.eval()
     yhat_train = []

@@ -18,7 +18,7 @@ def preprocess(scheme: str, corrupt_range: tuple):
         transforms.ToTensor(),
     ]
     normalize = transforms.Normalize(mean, std)
-    if scheme in ["baseline", "gaussian"]:
+    if scheme in ["baseline", "gaussian", "mix"]:
         corrupt_tfm = []
     elif scheme == "crop":
         corrupt_tfm = [RandomAreaDownUp(out_size=224, area_frac_range=corrupt_range)]
