@@ -2,7 +2,7 @@ import math
 import os
 import random
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import dataloader
 import numpy as np
@@ -374,6 +374,95 @@ def apply_mix_embeddings(
     return mixed, pair_labels, perm
 
 
+def _select_unique_mix_pairs(
+    mix_perm: Optional[torch.Tensor],
+    mix_pairs: Optional[torch.Tensor],
+    max_pairs: Optional[int] = None,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+    if mix_perm is None:
+        return None
+
+    perm = mix_perm.view(-1).cpu()
+    pair_labels = mix_pairs.cpu() if mix_pairs is not None else None
+
+    idx_a: List[int] = []
+    idx_b: List[int] = []
+    labels: List[torch.Tensor] = []
+    seen = set()
+
+    for i in range(len(perm)):
+        partner = int(perm[i])
+        if partner == i:
+            continue
+
+        key = tuple(sorted((i, partner)))
+        if key in seen:
+            continue
+
+        if pair_labels is not None:
+            lbl_pair = pair_labels[i]
+            if lbl_pair[0].item() == lbl_pair[1].item():
+                continue
+            labels.append(lbl_pair)
+
+        idx_a.append(i)
+        idx_b.append(partner)
+        seen.add(key)
+
+        if max_pairs is not None and len(idx_a) >= max_pairs:
+            break
+
+    if not idx_a:
+        return None
+
+    idx_a_tensor = torch.tensor(idx_a, dtype=torch.long)
+    idx_b_tensor = torch.tensor(idx_b, dtype=torch.long)
+    label_tensor = torch.stack(labels, dim=0) if labels else None
+
+    return idx_a_tensor, idx_b_tensor, label_tensor
+
+
+def build_mixed_embedding_sets(
+    reconstructed_embeddings: torch.Tensor,
+    raw_embeddings: torch.Tensor,
+    mix_perm: Optional[torch.Tensor],
+    mix_pairs: Optional[torch.Tensor],
+    alpha: Optional[float],
+    normalize: bool,
+    max_pairs: Optional[int] = None,
+) -> Optional[Dict[str, torch.Tensor]]:
+    pair_selection = _select_unique_mix_pairs(mix_perm, mix_pairs, max_pairs)
+    if pair_selection is None:
+        print("No suitable mix pairs found for reconstructed embedding mixing.")
+        return None
+
+    idx_a, idx_b, label_pairs = pair_selection
+    mix_alpha = alpha if alpha is not None else 0.5
+
+    def _mix(embeds: torch.Tensor) -> torch.Tensor:
+        mixed = mix_alpha * embeds[idx_a] + (1.0 - mix_alpha) * embeds[idx_b]
+        if normalize:
+            mixed = F.normalize(mixed, dim=-1)
+        return mixed
+
+    recon_mix = _mix(reconstructed_embeddings)
+    raw_mix = _mix(raw_embeddings)
+
+    metadata: Dict[str, torch.Tensor] = {
+        "mix_reconstructed": recon_mix,
+        "mix_raw": raw_mix,
+        "pair_indices": torch.stack((idx_a, idx_b), dim=1),
+    }
+    if label_pairs is not None:
+        metadata["pair_labels"] = label_pairs
+
+    print(
+        f"Prepared {recon_mix.size(0)} mixed embeddings (alpha={mix_alpha:.2f})"
+        " for reconstructed vs. raw baselines."
+    )
+    return metadata
+
+
 def knn_predict(
     train_feats,
     train_labels,
@@ -438,6 +527,7 @@ def reconstruct(
     unclip_configs: Optional[UnCLIPConfigs] = None,
 ):
     encoder_bundle = load_encoder(encoder_configs, global_configs.device)
+    normalize_features = encoder_bundle.get("normalize", True)
     clean_embeds_n_labels = get_embeddings_n_labels(global_configs, encoder_bundle)
     corrupt_embeds_n_labels = get_embeddings_n_labels(
         global_configs, encoder_bundle, corruption=True
@@ -449,6 +539,8 @@ def reconstruct(
     corrupt_valid_embeddings = corrupt_embeds_n_labels["embeddings"]["valid"]
     train_labels = clean_embeds_n_labels["labels"]["train"]
     valid_labels = clean_embeds_n_labels["labels"]["valid"]
+    mix_pairs_valid = corrupt_embeds_n_labels["mix_pairs"]["valid"]
+    mix_perm_valid = corrupt_embeds_n_labels["mix_perm"]["valid"]
 
     if restore_configs.method == "ridge":
         W, b = fit_ridge_linear_map(
@@ -470,14 +562,13 @@ def reconstruct(
             corrupt_valid_embeddings,
         )
         feature_dim = encoder_bundle["feature_dim"]
-        normalize_outputs = encoder_bundle.get("normalize", True)
         model, losses = train(
             restore_configs,
             train_loader,
             val_loader,
             global_configs.device,
             feature_dim,
-            normalize_outputs,
+            normalize_features,
         )
         model.eval()
         train_embeds_pred, valid_embeds_pred = evaluate(
@@ -485,7 +576,7 @@ def reconstruct(
             train_eval_loader,
             val_loader,
             global_configs.device,
-            normalize_outputs,
+            normalize_features,
             restore_method=restore_configs.method,
         )
         print(f"pred train embeds: {train_embeds_pred.shape}")
@@ -512,12 +603,52 @@ def reconstruct(
         f"{global_configs.scheme} k-NN accuracy (k={global_configs.k_neighbors}): {accuracy * 100:.2f}%"
     )
 
+    mix_metadata = None
+    if (
+        global_configs.scheme == "mix"
+        and mix_perm_valid is not None
+        and clean_valid_embeddings.size(0) > 0
+        and unclip_configs is not None
+        and unclip_configs.enabled
+    ):
+        max_pairs = unclip_configs.num_images
+        mix_metadata = build_mixed_embedding_sets(
+            reconstructed_embeddings=valid_embeds_pred,
+            raw_embeddings=clean_valid_embeddings,
+            mix_perm=mix_perm_valid,
+            mix_pairs=mix_pairs_valid,
+            alpha=global_configs.mix_alpha,
+            normalize=normalize_features,
+            max_pairs=max_pairs,
+        )
+
     if encoder_configs.encoder_type.lower() == "clip":
-        maybe_generate_images_with_unclip(
+        pipeline = None
+        seed_offset = 0
+        pipeline, seed_offset = maybe_generate_images_with_unclip(
             valid_embeds_pred,
             unclip_configs,
             global_configs.device,
         )
+        if mix_metadata is not None:
+            pipeline, seed_offset = maybe_generate_images_with_unclip(
+                mix_metadata.get("mix_reconstructed"),
+                unclip_configs,
+                global_configs.device,
+                output_dir_suffix="mix_reconstructed",
+                filename_prefix="mix_recon",
+                seed_offset=seed_offset,
+                pipeline=pipeline,
+            )
+            pipeline, seed_offset = maybe_generate_images_with_unclip(
+                mix_metadata.get("mix_raw"),
+                unclip_configs,
+                global_configs.device,
+                output_dir_suffix="mix_raw",
+                filename_prefix="mix_raw",
+                seed_offset=seed_offset,
+                pipeline=pipeline,
+            )
 
 
 def create_dataloaders(
@@ -685,24 +816,28 @@ def evaluate(
 
 
 def maybe_generate_images_with_unclip(
-    embeddings: torch.Tensor,
+    embeddings: Optional[torch.Tensor],
     unclip_configs: Optional[UnCLIPConfigs],
     device: torch.device,
-):
-    if unclip_configs is None or not unclip_configs.enabled:
-        return
+    output_dir_suffix: Optional[str] = None,
+    filename_prefix: Optional[str] = None,
+    seed_offset: int = 0,
+    pipeline: Optional[StableUnCLIPImg2ImgPipeline] = None,
+) -> Tuple[Optional[StableUnCLIPImg2ImgPipeline], int]:
+    if (
+        embeddings is None
+        or embeddings.numel() == 0
+        or unclip_configs is None
+        or not unclip_configs.enabled
+    ):
+        return pipeline, seed_offset
 
     torch_device = torch.device(device)
-
     num_embeddings = embeddings.size(0)
-    if num_embeddings == 0:
-        print("No embeddings available for Stable unCLIP decoding.")
-        return
-
     num_to_generate = min(unclip_configs.num_images, num_embeddings)
     if num_to_generate <= 0:
         print("Stable unCLIP generation skipped (num_images <= 0).")
-        return
+        return pipeline, seed_offset
 
     dtype_map = {
         "fp16": torch.float16,
@@ -714,22 +849,31 @@ def maybe_generate_images_with_unclip(
     }
     target_dtype = dtype_map.get(unclip_configs.torch_dtype.lower(), torch.float32)
 
-    os.makedirs(unclip_configs.output_dir, exist_ok=True)
-    print(
-        f"Loading Stable unCLIP pipeline '{unclip_configs.model_id}' for decoding {num_to_generate} embeddings..."
+    target_dir = (
+        os.path.join(unclip_configs.output_dir, output_dir_suffix)
+        if output_dir_suffix
+        else unclip_configs.output_dir
     )
+    os.makedirs(target_dir, exist_ok=True)
+    prefix = filename_prefix or (output_dir_suffix or "valid")
 
-    pipe = StableUnCLIPImg2ImgPipeline.from_pretrained(
-        unclip_configs.model_id,
-        torch_dtype=target_dtype,
-    )
-    pipe = pipe.to(torch_device)
-    pipe.set_progress_bar_config(disable=True)
-    if unclip_configs.enable_attention_slicing:
-        pipe.enable_attention_slicing()
+    if pipeline is None:
+        print(
+            f"Loading Stable unCLIP pipeline '{unclip_configs.model_id}' "
+            f"for decoding up to {num_to_generate} embeddings..."
+        )
+        pipeline = StableUnCLIPImg2ImgPipeline.from_pretrained(
+            unclip_configs.model_id,
+            torch_dtype=target_dtype,
+        )
+        pipeline = pipeline.to(torch_device)
+        pipeline.set_progress_bar_config(disable=True)
+        if unclip_configs.enable_attention_slicing:
+            pipeline.enable_attention_slicing()
 
     selected = embeddings[:num_to_generate].to(device=torch_device, dtype=target_dtype)
     batch_size = max(1, unclip_configs.batch_size)
+    total_generated = 0
 
     for start in range(0, num_to_generate, batch_size):
         end = min(start + batch_size, num_to_generate)
@@ -737,10 +881,10 @@ def maybe_generate_images_with_unclip(
         generator = None
         if unclip_configs.seed is not None:
             generator = torch.Generator(device=torch_device)
-            generator.manual_seed(unclip_configs.seed + start)
+            generator.manual_seed(unclip_configs.seed + seed_offset + start)
 
         prompts = [""] * (end - start)
-        outputs = pipe(
+        outputs = pipeline(
             image=None,
             prompt=prompts,
             image_embeds=batch,
@@ -750,11 +894,13 @@ def maybe_generate_images_with_unclip(
         )
         for idx, pil_img in enumerate(outputs.images):
             global_idx = start + idx
-            file_path = os.path.join(
-                unclip_configs.output_dir, f"valid_{global_idx:04d}.png"
-            )
+            file_path = os.path.join(target_dir, f"{prefix}_{global_idx:04d}.png")
             pil_img.save(file_path)
             print(f"Saved unCLIP image -> {file_path}")
+
+        total_generated += end - start
+
+    return pipeline, seed_offset + total_generated
 
 
 def main():
