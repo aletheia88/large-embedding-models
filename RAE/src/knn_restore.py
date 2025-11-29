@@ -11,6 +11,8 @@ import torch.nn.functional as F
 from diffusers import StableUnCLIPImg2ImgPipeline
 from restore_methods import (
     ResidualMLP,
+    HopfieldLayerDecoder,
+    HopfieldAssociateDecoder,
     evaluate_reconstruction,
     fit_ridge_linear_map,
     linear_map_predict,
@@ -51,8 +53,10 @@ def set_up():
         num_workers=num_workers,
         generator=generator,
     )
-    lam = None  # lam = 1 for "ridge" regressor method
-    method = "mlp"  # options: "ridge", "mlp"
+    # lam = 1 for "ridge" regressor method
+    lam = None
+    # options: "ridge", "mlp", "hopfield", "hopfield-associate"
+    method = "hopfield-associate"
     hidden_dims = 2048
     num_layers = 3
     dropout = 0.1
@@ -77,6 +81,8 @@ def set_up():
         model_subfolder = None
         processor_subfolder = None
         normalize_features = True
+
+    print("Building Encoder configs...")
     encoder_configs = EncoderConfigs(
         encoder_type=encoder_type,
         model_name=encoder_model_name,
@@ -404,7 +410,7 @@ def reconstruct(
         train_embeds_pred = linear_map_predict(corrupt_train_embeddings, W, b)
         valid_embeds_pred = linear_map_predict(corrupt_valid_embeddings, W, b)
 
-    if restore_configs.method == "mlp":
+    if restore_configs.method in ["mlp", "hopfield", "hopfield-associate"]:
         # dataloader for image embeddings
         train_loader, train_eval_loader, val_loader = create_dataloaders(
             global_configs,
@@ -431,6 +437,7 @@ def reconstruct(
             val_loader,
             global_configs.device,
             normalize_outputs,
+            restore_method=restore_configs.method,
         )
         print(f"pred train embeds: {train_embeds_pred.shape}")
         print(f"pred valid embeds: {valid_embeds_pred.shape}")
@@ -497,13 +504,22 @@ def train(
 ):
     in_dim = feature_dim
     out_dim = feature_dim
-    model = ResidualMLP(
-        in_dim,
-        restore_configs.hidden_dims,
-        out_dim,
-        num_layers=restore_configs.num_layers,
-        dropout=restore_configs.dropout,
-    ).to(device)
+    restore_method = restore_configs.method
+
+    if restore_method == "mlp":
+        model = ResidualMLP(
+            in_dim,
+            restore_configs.hidden_dims,
+            out_dim,
+            num_layers=restore_configs.num_layers,
+            dropout=restore_configs.dropout,
+        ).to(device)
+    if restore_method == "hopfield":
+        model = HopfieldLayerDecoder(embeds_dim=in_dim).to(device)
+
+    if restore_method == "hopfield-associate":
+        model = HopfieldAssociateDecoder(embeds_dim=in_dim).to(device)
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=1e-3,
@@ -522,7 +538,12 @@ def train(
         for xb, yb in train_loader:
             xb = xb.to(device)
             yb = yb.to(device)
-            y_pred = model(xb)
+
+            if restore_method in ["mlp", "hopfield"]:
+                y_pred = model(xb)
+            if restore_method == "hopfield-associate":
+                y_pred = model(xb, yb)
+
             if normalize_outputs:
                 y_pred = F.normalize(y_pred, dim=-1)
             loss = F.mse_loss(y_pred, yb)
@@ -543,7 +564,12 @@ def train(
             for xb, yb in val_loader:
                 xb = xb.to(device)
                 yb = yb.to(device)
-                preds = model(xb)
+
+                if restore_method in ["mlp", "hopfield"]:
+                    preds = model(xb)
+                if restore_method == "hopfield-associate":
+                    preds = model(xb, yb)
+
                 if normalize_outputs:
                     preds = F.normalize(preds, dim=-1)
                 batch_loss = F.mse_loss(preds, yb)
@@ -552,7 +578,7 @@ def train(
         epoch_val_loss = val_loss / max(val_samples, 1)
         losses["val"].append(epoch_val_loss)
         print(
-            f"Epoch {epoch+1}/{num_epochs} - train_loss: {epoch_train_loss:.6f} - val_loss: {epoch_val_loss:.6f}"
+            f"Epoch {epoch + 1}/{num_epochs} - train_loss: {epoch_train_loss:.6f} - val_loss: {epoch_val_loss:.6f}"
         )
 
         if epoch_val_loss < best_val:
@@ -569,13 +595,24 @@ def train(
     return model, losses
 
 
-def evaluate(model, train_eval_loader, val_loader, device, normalize_outputs: bool):
+def evaluate(
+    model,
+    train_eval_loader,
+    val_loader,
+    device,
+    normalize_outputs: bool,
+    restore_method: str,
+):
     model.eval()
     yhat_train = []
     with torch.no_grad():
         for xb, yb in train_eval_loader:
             xb = xb.to(device)
-            preds = model(xb)
+            if restore_method == "hopfield-associate":
+                yb = yb.to(device)
+                preds = model(xb, yb)
+            else:
+                preds = model(xb)
             if normalize_outputs:
                 preds = F.normalize(preds, dim=-1)
             yhat_train.append(preds.cpu())
@@ -585,7 +622,11 @@ def evaluate(model, train_eval_loader, val_loader, device, normalize_outputs: bo
     with torch.no_grad():
         for xb, yb in val_loader:
             xb = xb.to(device)
-            preds = model(xb)
+            if restore_method == "hopfield-associate":
+                yb = yb.to(device)
+                preds = model(xb, yb)
+            else:
+                preds = model(xb)
             if normalize_outputs:
                 preds = F.normalize(preds, dim=-1)
             yhat_val.append(preds.cpu())

@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+import hflayers as hf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -113,3 +113,116 @@ class ResidualMLP(nn.Module):
         x = self.ln_in(x)
         y = self.net(x)
         return y + self.proj(x0)  # residual skip
+
+
+class HopfieldLayerDecoder(nn.Module):
+    """
+    Hopfield layer behaves like a parametric associative memory. For each
+    corrupted embedding, it looks up a mixture of internal patterns and returns
+    a vector of the same dimension
+    """
+
+    def __init__(
+        self,
+        embeds_dim: int = 768,
+        hidden_dim: int = 512,
+        quantity: int = 128,
+        beta: float = 1.0,
+    ):
+        super().__init__()
+        # project into Hopfield space
+        self.in_proj = nn.Sequential(
+            nn.LayerNorm(embeds_dim),
+            nn.Linear(embeds_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        # Hopfield layer lives inside `hidden_dim`
+        self.hopfield = hf.HopfieldLayer(
+            input_size=hidden_dim,  # state pattern R
+            hidden_size=hidden_dim,  # associative space W_Q, W_K
+            pattern_size=hidden_dim,  # pattern / output space W_V
+            quantity=quantity,  # number of memory slots
+            scaling=beta,
+            stored_pattern_as_static=True,
+            state_pattern_as_static=False,
+            pattern_projection_as_static=True,
+        )
+        # project back to embedding space
+        self.out_proj = nn.Sequential(
+            nn.Linear(hidden_dim, embeds_dim),
+            nn.LayerNorm(embeds_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # h: (B, embeds_dim)
+        h = self.in_proj(x)
+        # h_seq: (B, 1, hidden_dim)
+        # Hopfield layer expects a length-1 sequence
+        h_seq = h.unsqueeze(1)
+        # z: (B, 1, hidden_dim)
+        z = self.hopfield(h_seq)
+        # z: (B, hidden_dim)
+        z = z.squeeze(1)
+        # out: (B, embeds_dim)
+        out = self.out_proj(z)
+        out = out + x
+        return out
+
+
+class HopfieldAssociateDecoder(nn.Module):
+    """
+    Hopfield Associate Decoder retrieves from the clean embeddings, which are
+    memory items from the input stored patterns; therefore it is non-parametric.
+
+    In other words, here corrupted batch is used as queries, training clean
+    embeddings as stored patterns (possibly projected), no internal memory bank
+    needed.
+    """
+
+    def __init__(
+        self,
+        embeds_dim: int = 768,
+        hidden_size: int = 512,
+        beta: float = 1.0,
+    ):
+        super().__init__()
+        self.in_proj = nn.Sequential(
+            nn.LayerNorm(embeds_dim),
+            nn.Linear(embeds_dim, embeds_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.hopfield = hf.Hopfield(
+            input_size=embeds_dim,  # R (state pattern dimension)
+            hidden_size=hidden_size,  # associative (Q/K) space
+            stored_pattern_size=embeds_dim,  # Y
+            pattern_projection_size=embeds_dim,
+            scaling=beta,
+        )
+        self.out_proj = nn.Sequential(
+            nn.Linear(embeds_dim, embeds_dim),
+            nn.LayerNorm(embeds_dim),
+        )
+
+    def forward(self, corrupted_batch, clean_memory):
+        B, D = corrupted_batch.shape
+        M, _ = clean_memory.shape
+
+        R = self.in_proj(corrupted_batch)
+        Y = clean_memory
+
+        # Y: (1, M, D)
+        Y_ = Y.unsqueeze(0)
+        # R: (1, B, D)
+        R_ = R.unsqueeze(0)
+        P_ = Y_
+
+        # Z: (1, B, D)
+        # hopfield((stored_patterns, state_patterns, pattern_projections))
+        # stored_patterns: keys
+        # state_patterns: queries
+        # pattern_projections: values
+        Z_ = self.hopfield((Y_, R_, P_))
+        Z = Z_.squeeze(0)
+
+        out = self.out_proj(Z)
+        return out
