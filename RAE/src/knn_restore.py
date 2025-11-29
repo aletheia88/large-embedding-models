@@ -32,7 +32,7 @@ def set_up():
     batch_size = 64
     # seeds = [1912, 1985, 1976, 2001, 2024]
     seed = 1912
-    num_workers = 4
+    num_workers = 2
     # schemes = ["baseline", "crop", "occlude", "gaussian"]
     scheme = "mix"  # options: "baseline", "occlude", "mix", ...
     corrupt_range = (0.50, 0.70)
