@@ -34,8 +34,8 @@ def set_up():
     seed = 1912
     num_workers = 2
     # schemes = ["baseline", "crop", "occlude", "gaussian"]
-    scheme = "mix"  # options: "baseline", "occlude", "mix", ...
-    corrupt_range = (0.50, 0.70)
+    scheme = "occlude"  # we later mix reconstructed embeddings across classes
+    corrupt_range = (0.30, 0.50)
     k_neighbors = 25
     noise_std = None
     mix_alpha = 0.5
@@ -189,28 +189,9 @@ def get_embeddings_n_labels(configs, encoder_bundle, corruption=False):
         noise_std=configs.noise_std,
         max_items=None,
     )
-    mix_pairs = {"train": None, "valid": None}
-    mix_perm = {"train": None, "valid": None}
-    if corruption and scheme == "mix":
-        alpha = configs.mix_alpha if configs.mix_alpha is not None else 0.5
-        gen_train = torch.Generator().manual_seed(configs.seed)
-        train_embeddings, pair_train, perm_train = apply_mix_embeddings(
-            train_embeddings, train_labels, alpha, gen_train
-        )
-        mix_pairs["train"] = pair_train
-        mix_perm["train"] = perm_train
-
-        gen_valid = torch.Generator().manual_seed(configs.seed + 1)
-        valid_embeddings, pair_valid, perm_valid = apply_mix_embeddings(
-            valid_embeddings, valid_labels, alpha, gen_valid
-        )
-        mix_pairs["valid"] = pair_valid
-        mix_perm["valid"] = perm_valid
     return {
         "embeddings": {"train": train_embeddings, "valid": valid_embeddings},
         "labels": {"train": train_labels, "valid": valid_labels},
-        "mix_pairs": mix_pairs,
-        "mix_perm": mix_perm,
     }
 
 
@@ -374,10 +355,50 @@ def apply_mix_embeddings(
     return mixed, pair_labels, perm
 
 
+def generate_mix_pairs(
+    labels: torch.Tensor, generator: torch.Generator
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """
+    Build a deterministic mapping from each sample to a partner in a different class.
+
+    Returns:
+        perm: Long tensor where perm[i] gives the index paired with sample i.
+        pair_labels: Long tensor of shape [N, 2] containing the (class_i, class_j) pairs.
+    """
+    if labels.numel() == 0:
+        return None, None
+
+    labels = labels.clone()
+    unique_labels = torch.unique(labels, sorted=True)
+    if unique_labels.numel() < 2:
+        return None, None
+
+    perm = torch.empty_like(labels, dtype=torch.long)
+    class_to_indices: List[torch.Tensor] = []
+    for lbl in unique_labels:
+        idxs = torch.nonzero(labels == lbl, as_tuple=False).flatten()
+        if idxs.numel() == 0:
+            continue
+        order = torch.randperm(len(idxs), generator=generator)
+        class_to_indices.append(idxs[order])
+
+    if len(class_to_indices) < 2:
+        return None, None
+
+    for i, idxs in enumerate(class_to_indices):
+        next_idxs = class_to_indices[(i + 1) % len(class_to_indices)]
+        repeat = (len(idxs) + len(next_idxs) - 1) // len(next_idxs)
+        perm[idxs] = next_idxs.repeat(repeat)[: len(idxs)]
+
+    pair_labels = torch.stack([labels, labels[perm]], dim=1)
+    return perm, pair_labels
+
+
 def _select_unique_mix_pairs(
     mix_perm: Optional[torch.Tensor],
     mix_pairs: Optional[torch.Tensor],
     max_pairs: Optional[int] = None,
+    generator: Optional[torch.Generator] = None,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
     if mix_perm is None:
         return None
@@ -390,22 +411,26 @@ def _select_unique_mix_pairs(
     labels: List[torch.Tensor] = []
     seen = set()
 
-    for i in range(len(perm)):
-        partner = int(perm[i])
-        if partner == i:
-            continue
+    order = torch.arange(len(perm))
+    if generator is not None and len(order) > 1:
+        shuffle = torch.randperm(len(order), generator=generator)
+        order = order[shuffle]
 
-        key = tuple(sorted((i, partner)))
+    for idx in order.tolist():
+        partner = int(perm[idx])
+        if partner == idx:
+            continue
+        key = tuple(sorted((idx, partner)))
         if key in seen:
             continue
 
         if pair_labels is not None:
-            lbl_pair = pair_labels[i]
+            lbl_pair = pair_labels[idx]
             if lbl_pair[0].item() == lbl_pair[1].item():
                 continue
             labels.append(lbl_pair)
 
-        idx_a.append(i)
+        idx_a.append(idx)
         idx_b.append(partner)
         seen.add(key)
 
@@ -430,8 +455,11 @@ def build_mixed_embedding_sets(
     alpha: Optional[float],
     normalize: bool,
     max_pairs: Optional[int] = None,
+    pair_selection_generator: Optional[torch.Generator] = None,
 ) -> Optional[Dict[str, torch.Tensor]]:
-    pair_selection = _select_unique_mix_pairs(mix_perm, mix_pairs, max_pairs)
+    pair_selection = _select_unique_mix_pairs(
+        mix_perm, mix_pairs, max_pairs, generator=pair_selection_generator
+    )
     if pair_selection is None:
         print("No suitable mix pairs found for reconstructed embedding mixing.")
         return None
@@ -539,8 +567,12 @@ def reconstruct(
     corrupt_valid_embeddings = corrupt_embeds_n_labels["embeddings"]["valid"]
     train_labels = clean_embeds_n_labels["labels"]["train"]
     valid_labels = clean_embeds_n_labels["labels"]["valid"]
-    mix_pairs_valid = corrupt_embeds_n_labels["mix_pairs"]["valid"]
-    mix_perm_valid = corrupt_embeds_n_labels["mix_perm"]["valid"]
+    mix_perm_valid: Optional[torch.Tensor] = None
+    mix_pairs_valid: Optional[torch.Tensor] = None
+    mix_pair_generator = torch.Generator().manual_seed(global_configs.seed + 1234)
+    mix_perm_valid, mix_pairs_valid = generate_mix_pairs(
+        valid_labels, mix_pair_generator
+    )
 
     if restore_configs.method == "ridge":
         W, b = fit_ridge_linear_map(
@@ -605,13 +637,13 @@ def reconstruct(
 
     mix_metadata = None
     if (
-        global_configs.scheme == "mix"
-        and mix_perm_valid is not None
+        mix_perm_valid is not None
         and clean_valid_embeddings.size(0) > 0
         and unclip_configs is not None
         and unclip_configs.enabled
     ):
         max_pairs = unclip_configs.num_images
+        pair_selector = torch.Generator().manual_seed(global_configs.seed + 777)
         mix_metadata = build_mixed_embedding_sets(
             reconstructed_embeddings=valid_embeds_pred,
             raw_embeddings=clean_valid_embeddings,
@@ -620,6 +652,7 @@ def reconstruct(
             alpha=global_configs.mix_alpha,
             normalize=normalize_features,
             max_pairs=max_pairs,
+            pair_selection_generator=pair_selector,
         )
 
     if encoder_configs.encoder_type.lower() == "clip":
